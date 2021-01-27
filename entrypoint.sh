@@ -35,14 +35,21 @@ FORCE_UPDATE="${INPUT_FORCE_UPDATE}"
 
 DELAY_EXIT=false
 
+TIME_OUT="${INPUT_TIMEOUT}"
+RETRY_TIMES=3
+
 function err_exit {
   echo -e "\033[31m $1 \033[0m"
   exit 1
 }
 
+FAILED_LIST=()
+
 function delay_exit {
   echo -e "\033[31m $1 \033[0m"
+  FAILED_LIST+=($2)
   DELAY_EXIT=true
+  return 1
 }
 
 if [[ "$ACCOUNT_TYPE" == "org" ]]; then
@@ -75,13 +82,33 @@ else
   err_exit "Unknown src args, the `src` should be `[github|gittee]/account`"
 fi
 
+function retry {
+  local retries=$RETRY_TIMES
+  local count=0
+  until timeout $TIME_OUT "$@"; do
+    exit=$?
+    wait=$((2 ** $count))
+    count=$(($count + 1))
+    if [ $count -lt $retries ]; then
+      echo "Retry $count/$retries exited $exit, retrying in $wait seconds..."
+      sleep $wait
+    else
+      echo "Retry $count/$retries exited $exit, no more retries left."
+      return $exit
+    fi
+  done
+  return 0
+}
+
 function get_all_repo_names
 {
   PAGE_NUM=100
-  if [[ "$SRC_TYPE" == "github" ]]; then
-    total=`curl -sI "$SRC_REPO_LIST_API?page=1&per_page=$PAGE_NUM" | sed -nr "s/^[lL]ink:.*page=([0-9]+)&per_page=$PAGE_NUM.*/\1/p"`
-  elif [[ "$SRC_TYPE" == "gitee" ]]; then
-    total=`curl -sI "$SRC_REPO_LIST_API?page=1&per_page=$PAGE_NUM" | grep total_page: |cut -d ' ' -f2 |tr -d '\r'`
+  URL=$1
+  HUB_TYPE=$2
+  if [[ "$HUB_TYPE" == "github" ]]; then
+    total=`curl -sI "$URL?page=1&per_page=$PAGE_NUM" | sed -nr "s/^[lL]ink:.*page=([0-9]+)&per_page=$PAGE_NUM.*/\1/p"`
+  elif [[ "$HUB_TYPE" == "gitee" ]]; then
+    total=`curl -sI "$URL?page=1&per_page=$PAGE_NUM" | grep total_page: |cut -d ' ' -f2 |tr -d '\r'`
   fi
 
   # use pagination?
@@ -92,14 +119,14 @@ function get_all_repo_names
 
   p=1
   while [ "$p" -le "$total" ]; do
-    x=`curl -s "$SRC_REPO_LIST_API?page=$p&per_page=$PAGE_NUM" | jq '.[] | .name' |  sed 's/"//g'`
+    x=`curl -s "$URL?page=$p&per_page=$PAGE_NUM" | jq '.[] | .name' |  sed 's/"//g'`
     echo $x
     p=$(($p + 1))
   done
 }
 
 if [[ -z $STATIC_LIST ]]; then
-  SRC_REPOS=`get_all_repo_names`
+  SRC_REPOS=`get_all_repo_names $SRC_REPO_LIST_API $SRC_TYPE`
 else
   SRC_REPOS=`echo $STATIC_LIST | tr ',' ' '`
 fi
@@ -114,11 +141,13 @@ else
   err_exit "Unknown dst args, the `dst` should be `[github|gittee]/account`"
 fi
 
+DST_REPOS=`get_all_repo_names $DST_REPO_LIST_API $DST_TYPE`
+
 function clone_repo
 {
   echo -e "\033[31m(0/3)\033[0m" "Downloading..."
   if [ ! -d "$1" ]; then
-    git clone $SRC_REPO_BASE_URL$SRC_ACCOUNT/$1.git
+    retry git clone $SRC_REPO_BASE_URL$SRC_ACCOUNT/$1.git
   fi
   cd $1
 }
@@ -126,22 +155,22 @@ function clone_repo
 function create_repo
 {
   # Auto create non-existing repo
-  has_repo=`curl $DST_REPO_LIST_API | jq '.[] | select(.full_name=="'$DST_ACCOUNT'/'$1'").name' | wc -l`
+  has_repo=`echo $DST_REPOS | grep -Fx $1 | wc -l`
   if [ $has_repo == 0 ]; then
     echo "Create non-exist repo..."
     if [[ "$DST_TYPE" == "github" ]]; then
-      curl -H "Authorization: token $2" --data '{"name":"'$1'"}' $DST_REPO_CREATE_API
+      curl -s -H "Authorization: token $2" --data '{"name":"'$1'"}' $DST_REPO_CREATE_API > /dev/null
     elif [[ "$DST_TYPE" == "gitee" ]]; then
-      curl -X POST --header 'Content-Type: application/json;charset=UTF-8' $DST_REPO_CREATE_API -d '{"name": "'$1'","access_token": "'$2'"}'
+      curl -s -X POST --header 'Content-Type: application/json;charset=UTF-8' $DST_REPO_CREATE_API -d '{"name": "'$1'","access_token": "'$2'"}' > /dev/null
     fi
   fi
-  git remote add $DST_TYPE git@$DST_TYPE.com:$DST_ACCOUNT/$1.git
+  git remote add $DST_TYPE git@$DST_TYPE.com:$DST_ACCOUNT/$1.git || echo "Remote already exists."
 }
 
 function update_repo
 {
   echo -e "\033[31m(1/3)\033[0m" "Updating..."
-  git pull -p
+  retry git pull -p
 }
 
 function import_repo
@@ -149,9 +178,9 @@ function import_repo
   echo -e "\033[31m(2/3)\033[0m" "Importing..."
   git remote set-head origin -d
   if [[ "$FORCE_UPDATE" == "true" ]]; then
-    git push -f $DST_TYPE refs/remotes/origin/*:refs/heads/* --tags --prune
+    retry git push -f $DST_TYPE refs/remotes/origin/*:refs/heads/* --tags --prune
   else
-    git push $DST_TYPE refs/remotes/origin/*:refs/heads/* --tags --prune
+    retry git push $DST_TYPE refs/remotes/origin/*:refs/heads/* --tags --prune
   fi
 }
 
@@ -196,15 +225,15 @@ for repo in $SRC_REPOS
   if test_black_white_list $repo ; then
     echo -e "\n\033[31mBackup $repo ...\033[0m"
 
-    clone_repo $repo || echo "clone and cd failed"
+    cd $CACHE_PATH
 
-    create_repo $repo $DST_TOKEN || echo "create failed"
+    clone_repo $repo || delay_exit "clone and cd failed"  $repo || continue
 
-    update_repo || echo "Update failed"
+    create_repo $repo $DST_TOKEN || delay_exit "create failed" $repo || continue
 
-    import_repo && success=$(($success + 1)) || delay_exit "Push failed"
+    update_repo || delay_exit "Update failed" $repo || continue
 
-    cd ..
+    import_repo && success=$(($success + 1)) || delay_exit "Push failed" $repo || continue
   else
     skip=$(($skip + 1))
   fi
@@ -212,6 +241,7 @@ for repo in $SRC_REPOS
 
 failed=$(($all - $skip - $success))
 echo "Total: $all, skip: $skip, successed: $success, failed: $failed."
+echo "Failed: "$FAILED_LIST
 
 if [[ "$DELAY_EXIT" == "true" ]]; then
   exit 1
